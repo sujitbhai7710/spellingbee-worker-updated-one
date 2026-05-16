@@ -1,0 +1,15 @@
+name = "spelling-bee-api"
+main = "src/index.js"
+compatibility_date = "2024-05-01"
+
+# D1 Database Configuration
+[[d1_databases]]
+binding = "DB"
+database_name = "spelling_bee"
+database_id = "07d50185-619d-40f9-bcd9-bb46ae5bd142"
+
+
+
+# Scheduled Trigger - Runs at 8:01, 8:05, and 8:30 UTC every day
+[triggers]
+crons = ["1 8 * * *", "5 8 * * *", "44 8 * * *"] 

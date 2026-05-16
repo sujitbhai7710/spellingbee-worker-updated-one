@@ -1,0 +1,16 @@
+{
+  "name": "spelling-bee-api",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker API for Spelling Bee puzzles",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "export-db": "python export_db_to_sql.py"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^4.15.2"
+  }
+}
