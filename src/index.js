@@ -124,11 +124,14 @@ class Router {
 // ============================================================
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data, null, 2), {
+  // Extract _cacheControl before serialization so it doesn't leak into JSON body
+  const cacheControl = data._cacheControl || 'no-cache';
+  const { _cacheControl, ...dataWithoutCache } = data;
+  return new Response(JSON.stringify(dataWithoutCache, null, 2), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': data._cacheControl || 'no-cache',
+      'Cache-Control': cacheControl,
       ...corsHeaders,
       ...extraHeaders,
     },
@@ -173,7 +176,7 @@ function isAuthenticated(request, env) {
   return queryKey && queryKey === env.APIKEY;
 }
 
-async function checkRateLimit(request, env) {
+async function checkRateLimit(request, env, ctx) {
   // Simple IP-based rate limiting using Cloudflare Cache API
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const authed = isAuthenticated(request, env);
@@ -196,7 +199,11 @@ async function checkRateLimit(request, env) {
         'Cache-Control': `public, max-age=${RATE_LIMIT_WINDOW}`,
       },
     });
-    ctx.waitUntil && cache.put(cacheUrl, response);
+    if (ctx && ctx.waitUntil) {
+      ctx.waitUntil(cache.put(cacheUrl, response));
+    } else {
+      await cache.put(cacheUrl, response);
+    }
 
     return true;
   } catch {
@@ -605,10 +612,17 @@ function calculatePuzzleEnrichments(words) {
 
 // PERF FIX: Get latest puzzle by date using SQL, not fetching ALL puzzles
 // DATE FIX: Only return puzzles with date <= today (prevents future puzzles from showing)
-async function getLatestPuzzle(env, offset = 0) {
-  // Get today's date in ISO format for filtering
+// Get today's date in Eastern time (America/New_York)
+// The NYT Spelling Bee updates at midnight Eastern time
+function getEasternDateISO() {
   const now = new Date();
-  const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const easternTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  return `${easternTime.getFullYear()}-${String(easternTime.getMonth() + 1).padStart(2, '0')}-${String(easternTime.getDate()).padStart(2, '0')}`;
+}
+
+async function getLatestPuzzle(env, offset = 0) {
+  // Get today's date in ISO format for filtering (using Eastern time)
+  const todayISO = getEasternDateISO();
 
   // Get the puzzle at position (offset from latest) by date
   // CRITICAL FIX: Use date_iso for sorting AND filter out future puzzles
@@ -1019,9 +1033,8 @@ router.get('/api/last/([0-9]+)', async (request, env, params) => {
   }
   const count = Math.min(rawCount, 10); // Cap at 10 for performance
 
-  // DATE FIX: Filter out future puzzles
-  const now = new Date();
-  const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  // DATE FIX: Filter out future puzzles (using Eastern time)
+  const todayISO = getEasternDateISO();
 
   // Get the last N puzzles ordered by date (FIX: use date_iso for correct sorting, filter future)
   const puzzlesStmt = env.DB.prepare(`
@@ -1285,6 +1298,31 @@ router.get('/api/centerLetterCombo/([A-Za-z])', async (request, env, params) => 
   return jsonResponse(successResponse({
     centerLetter: letter,
     puzzles: result.results,
+    totalPuzzles: result.results.length,
+  }, {}, CACHE_TTL_READONLY));
+});
+
+// NEW: Pangram History - find other days with the same pangram word
+router.get('/api/pangramHistory/([A-Za-z]+)', async (request, env, params) => {
+  const word = params[0].toLowerCase();
+  if (!word || word.length < 4) {
+    return jsonResponse(errorResponse('Invalid word parameter', 400), 400);
+  }
+
+  const stmt = env.DB.prepare(`
+    SELECT p.puzzle_id, p.date, p.letters, p.all_letters, p.word_count, p.pangrams_count
+    FROM puzzles p
+    JOIN words w ON p.puzzle_id = w.puzzle_id
+    WHERE w.word = ? AND w.is_pangram = 1
+    ORDER BY p.date_iso DESC
+    LIMIT 20
+  `).bind(word);
+
+  const result = await stmt.all();
+
+  return jsonResponse(successResponse({
+    word: word,
+    pangramHistory: result.results,
     totalPuzzles: result.results.length,
   }, {}, CACHE_TTL_READONLY));
 });
