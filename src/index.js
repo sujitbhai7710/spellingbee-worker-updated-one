@@ -1,6 +1,16 @@
 /**
- * Spelling Bee API Worker v2.0
+ * Spelling Bee API Worker v2.1
  * Cloudflare Worker providing access to Spelling Bee puzzle data
+ * 
+ * Changelog v2.1:
+ * - CRITICAL FIX: Date sorting now uses date_iso (YYYY-MM-DD) column instead of
+ *   the human-readable "Month Day, Year" format which sorted alphabetically.
+ *   This fixes /today, /yesterday, /api/puzzles, /api/last, /api/search/date
+ *   returning September puzzles first instead of the actual latest puzzles.
+ * - Added /api/admin/migrate-date-iso endpoint to add date_iso column & backfill
+ * - storePuzzleData now also inserts date_iso for new puzzles
+ * - Added dateToISO() helper to convert "Month Day, Year" → "YYYY-MM-DD"
+ * - [slug].astro search: /api/puzzles/list now supports ?search= param for date filtering
  * 
  * Changelog v2.0:
  * - CRITICAL FIX: /api/last/:count now orders by date DESC (not puzzle_id)
@@ -30,8 +40,8 @@
 // CONSTANTS & CONFIGURATION
 // ============================================================
 
-const API_VERSION = '2.0.0';
-const BASE_URL = 'https://sbsolver.online';
+const API_VERSION = '2.1.0';
+const BASE_URL = 'https://spellingbeesolver.dev';
 const MAX_PAGINATION_LIMIT = 100;
 const DEFAULT_PAGINATION_LIMIT = 20;
 const CACHE_TTL_READONLY = 300;   // 5 min cache for read endpoints
@@ -395,6 +405,30 @@ function normalizeDate(dateStr) {
   return dateStr;
 }
 
+/**
+ * Convert "Month Day, Year" format to ISO "YYYY-MM-DD" for proper sorting.
+ * Examples: "September 9, 2025" → "2025-09-09", "May 17, 2026" → "2026-05-17"
+ * This is CRITICAL because SQLite sorts "September" > "May" alphabetically,
+ * which breaks ORDER BY date DESC when dates are in human-readable format.
+ */
+function dateToISO(dateStr) {
+  if (!dateStr) return '1970-01-01';
+  // Already ISO format
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+  // Parse "Month Day, Year"
+  const match = dateStr.match(/^(\w+)\s+(\d+),?\s+(\d+)$/);
+  if (!match) return '1970-01-01';
+  const months = {
+    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12
+  };
+  const month = months[match[1].toLowerCase()];
+  if (!month) return '1970-01-01';
+  const day = parseInt(match[2]);
+  const year = parseInt(match[3]);
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
 function formatDateForURL(date) {
   const months = [
     'january', 'february', 'march', 'april', 'may', 'june',
@@ -489,11 +523,14 @@ async function storePuzzleData(env, puzzleData) {
     const wordCount = puzzleData.answers ? puzzleData.answers.length : 0;
     const pangramsCount = puzzleData.pangrams ? puzzleData.pangrams.length : 0;
 
-    // Insert puzzle
+    // Compute ISO date for proper sorting
+    const dateIso = dateToISO(date);
+
+    // Insert puzzle (now includes date_iso for correct chronological sorting)
     await env.DB.prepare(`
-      INSERT INTO puzzles (puzzle_id, date, letters, all_letters, word_count, pangrams_count)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(nextPuzzleId, date, centerLetter, allLetters, wordCount, pangramsCount).run();
+      INSERT INTO puzzles (puzzle_id, date, date_iso, letters, all_letters, word_count, pangrams_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(nextPuzzleId, date, dateIso, centerLetter, allLetters, wordCount, pangramsCount).run();
 
     // PERF FIX: Batch insert words instead of N individual queries
     const insertedWords = [];
@@ -567,15 +604,21 @@ function calculatePuzzleEnrichments(words) {
 // ============================================================
 
 // PERF FIX: Get latest puzzle by date using SQL, not fetching ALL puzzles
+// DATE FIX: Only return puzzles with date <= today (prevents future puzzles from showing)
 async function getLatestPuzzle(env, offset = 0) {
+  // Get today's date in ISO format for filtering
+  const now = new Date();
+  const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
   // Get the puzzle at position (offset from latest) by date
+  // CRITICAL FIX: Use date_iso for sorting AND filter out future puzzles
   const stmt = env.DB.prepare(`
     SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count
     FROM puzzles
-    WHERE letters IS NOT NULL AND letters != ''
-    ORDER BY date DESC
+    WHERE letters IS NOT NULL AND letters != '' AND date_iso <= ?
+    ORDER BY date_iso DESC
     LIMIT 1 OFFSET ?
-  `).bind(offset);
+  `).bind(todayISO, offset);
 
   const puzzle = await stmt.first();
   if (!puzzle) return null;
@@ -704,21 +747,9 @@ function generateSitemap() {
     { path: '/privacy', priority: '0.5', changefreq: 'monthly' },
   ];
 
-  const last100Days = getLastNDays(100);
-  const dynamicRoutes = last100Days.map((date, index) => {
-    let priority = '0.7';
-    if (index === 0) priority = '1.0';
-    else if (index < 7) priority = '0.9';
-
-    return {
-      path: `/answer-for-${formatDateForURL(date)}`,
-      priority,
-      changefreq: 'daily',
-      lastmod: index === 0 ? now : date.toISOString().split('T')[0],
-    };
-  });
-
-  const allRoutes = [...staticRoutes, ...dynamicRoutes];
+  // No individual answer pages in sitemap to avoid duplicate indexing
+  // All puzzle data is accessible via /archive page with JS-based navigation
+  const allRoutes = [...staticRoutes];
 
   let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
   xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
@@ -750,18 +781,19 @@ function generateRSSFeed() {
   xml += `    <lastBuildDate>${now.toUTCString()}</lastBuildDate>\n`;
   xml += `    <atom:link href="${BASE_URL}/feed.xml" rel="self" type="application/rss+xml" />\n`;
 
+  // RSS items link to /archive instead of individual answer pages
+  // This avoids duplicate content issues for SEO
   for (const date of last20Days) {
-    const urlDate = formatDateForURL(date);
     const displayDate = date.toLocaleDateString('en-US', {
       year: 'numeric', month: 'long', day: 'numeric'
     });
 
     xml += '    <item>\n';
     xml += `      <title>Spelling Bee Answer for ${displayDate}</title>\n`;
-    xml += `      <link>${BASE_URL}/answer-for-${urlDate}</link>\n`;
+    xml += `      <link>${BASE_URL}/archive</link>\n`;
     xml += `      <description>Find the complete solution and word list for NYT Spelling Bee puzzle on ${displayDate}</description>\n`;
     xml += `      <pubDate>${date.toUTCString()}</pubDate>\n`;
-    xml += `      <guid isPermaLink="true">${BASE_URL}/answer-for-${urlDate}</guid>\n`;
+    xml += `      <guid isPermaLink="true">${BASE_URL}/archive</guid>\n`;
     xml += '    </item>\n';
   }
 
@@ -867,10 +899,11 @@ router.get('/api/puzzles', async (request, env) => {
   // Get total count
   const countResult = await env.DB.prepare(`SELECT COUNT(*) as total FROM puzzles`).first();
 
+  // CRITICAL FIX: Use date_iso for sorting (not date which is "Month Day, Year")
   const stmt = env.DB.prepare(`
     SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count 
     FROM puzzles 
-    ORDER BY date DESC
+    ORDER BY date_iso DESC
     LIMIT ? OFFSET ?
   `).bind(limit, offset);
 
@@ -892,6 +925,7 @@ router.get('/api/puzzles/list', async (request, env) => {
   const url = new URL(request.url);
   let limit = sanitizeInt(url.searchParams.get('limit'), 1, 50, DEFAULT_PAGINATION_LIMIT);
   const page = sanitizeInt(url.searchParams.get('page'), 1, 10000, 1);
+  const search = url.searchParams.get('search') || ''; // Support date search filter
 
   // Cap at 50
   if (limit > 50) limit = 50;
@@ -899,18 +933,27 @@ router.get('/api/puzzles/list', async (request, env) => {
   const offset = (page - 1) * limit;
 
   // Get total count
-  const countResult = await env.DB.prepare(`SELECT COUNT(*) as total FROM puzzles`).first();
+  let countSql = `SELECT COUNT(*) as total FROM puzzles`;
+  let listSql = `
+    SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count 
+    FROM puzzles`;
+  const bindings = [];
+
+  // If search param provided, filter by date
+  if (search) {
+    countSql += ` WHERE date = ? OR date LIKE ?`;
+    listSql += ` WHERE date = ? OR date LIKE ?`;
+    bindings.push(search, `%${search}%`);
+  }
+
+  listSql += ` ORDER BY date_iso DESC LIMIT ? OFFSET ?`;
+  const listBindings = [...bindings, limit, offset];
+
+  const countResult = await env.DB.prepare(countSql).bind(...bindings).first();
   const total = countResult?.total || 0;
 
-  // PERF FIX: Use SQL ORDER BY instead of fetching all and sorting in JS
-  const stmt = env.DB.prepare(`
-    SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count 
-    FROM puzzles
-    ORDER BY date DESC
-    LIMIT ? OFFSET ?
-  `).bind(limit, offset);
-
-  const result = await stmt.all();
+  // CRITICAL FIX: Use date_iso for sorting
+  const result = await env.DB.prepare(listSql).bind(...listBindings).all();
 
   return jsonResponse(successResponse({
     puzzles: result.results,
@@ -976,13 +1019,18 @@ router.get('/api/last/([0-9]+)', async (request, env, params) => {
   }
   const count = Math.min(rawCount, 10); // Cap at 10 for performance
 
-  // Get the last N puzzles ordered by date
+  // DATE FIX: Filter out future puzzles
+  const now = new Date();
+  const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+  // Get the last N puzzles ordered by date (FIX: use date_iso for correct sorting, filter future)
   const puzzlesStmt = env.DB.prepare(`
     SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count 
     FROM puzzles 
-    ORDER BY date DESC
+    WHERE date_iso <= ?
+    ORDER BY date_iso DESC
     LIMIT ?
-  `).bind(count);
+  `).bind(todayISO, count);
 
   const puzzlesResult = await puzzlesStmt.all();
   const puzzles = puzzlesResult.results || [];
@@ -1224,11 +1272,12 @@ router.get('/api/centerLetterCombo/([A-Za-z])', async (request, env, params) => 
     return jsonResponse(errorResponse('Invalid letter parameter', 400), 400);
   }
 
+  // FIX: Use date_iso for sorting
   const stmt = env.DB.prepare(`
     SELECT puzzle_id, date, all_letters, word_count, pangrams_count
     FROM puzzles
     WHERE letters = ?
-    ORDER BY date DESC
+    ORDER BY date_iso DESC
   `).bind(letter);
 
   const result = await stmt.all();
@@ -1368,12 +1417,12 @@ router.get('/api/search/date/([^/]+)', async (request, env, params) => {
     formattedQuery = `%, ${dateQuery}`;
   }
 
-  // FIX: Order by date DESC instead of puzzle_id DESC
+  // FIX: Order by date_iso DESC for correct chronological sorting
   const stmt = env.DB.prepare(`
     SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count 
     FROM puzzles 
     WHERE date LIKE ? OR date LIKE ? OR date LIKE ?
-    ORDER BY date DESC
+    ORDER BY date_iso DESC
   `).bind(`%${dateQuery}%`, `%${formattedQuery}%`, `%${dateQuery.replace(/-/g, ' ')}%`);
 
   const result = await stmt.all();
@@ -1426,14 +1475,14 @@ router.get('/api/search/letter/([A-Za-z])', async (request, env, params) => {
       SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count
       FROM puzzles 
       WHERE letters = ? 
-      ORDER BY date DESC
+      ORDER BY date_iso DESC
     `).bind(letter);
   } else {
     stmt = env.DB.prepare(`
       SELECT puzzle_id, date, letters, all_letters, word_count, pangrams_count
       FROM puzzles 
       WHERE all_letters LIKE ? 
-      ORDER BY date DESC
+      ORDER BY date_iso DESC
     `).bind(`%${letter}%`);
   }
 
@@ -1511,6 +1560,58 @@ router.get('/api/searchWordle/([A-Za-z])', async (request, env, params) => {
 // ============================================================
 // ADMIN ENDPOINTS (SECURITY FIX: POST method required)
 // ============================================================
+
+// Migration: Add date_iso column and backfill from existing date data
+router.post('/api/admin/migrate-date-iso', async (request, env) => {
+  if (!isAuthenticated(request, env)) {
+    return jsonResponse(errorResponse('Unauthorized. Provide valid API key via X-API-Key header or ?key= param', 401), 401);
+  }
+
+  try {
+    // Step 1: Add date_iso column if it doesn't exist
+    try {
+      await env.DB.prepare(`ALTER TABLE puzzles ADD COLUMN date_iso TEXT`).run();
+      console.log('Added date_iso column');
+    } catch (e) {
+      // Column already exists, that's fine
+      console.log('date_iso column already exists');
+    }
+
+    // Step 2: Backfill date_iso from date column
+    // Get all puzzles where date_iso is NULL or empty
+    const puzzles = await env.DB.prepare(
+      `SELECT puzzle_id, date FROM puzzles WHERE date_iso IS NULL OR date_iso = ''`
+    ).all();
+
+    const results = puzzles.results || [];
+    let updated = 0;
+    let errors = 0;
+
+    // Batch update in chunks
+    for (const puzzle of results) {
+      try {
+        const iso = dateToISO(puzzle.date);
+        await env.DB.prepare(
+          `UPDATE puzzles SET date_iso = ? WHERE puzzle_id = ?`
+        ).bind(iso, puzzle.puzzle_id).run();
+        updated++;
+      } catch (e) {
+        console.error(`Failed to update puzzle ${puzzle.puzzle_id}:`, e);
+        errors++;
+      }
+    }
+
+    return jsonResponse(successResponse({
+      message: 'Migration complete',
+      totalRecords: results.length,
+      updated,
+      errors,
+    }));
+  } catch (error) {
+    console.error('Migration error:', error);
+    return jsonResponse(errorResponse(error.message, 500), 500);
+  }
+});
 
 // Manual update - trigger NYT scrape
 router.post('/api/update/nyt', async (request, env, params, ctx) => {
